@@ -57,7 +57,12 @@ def cmd_catalog(exe, seeds_path, out):
             "blocks": [[b.start, b.end, sorted(set(b.successors)), int(b.is_exit)]
                        for b in sorted(f.blocks.values(), key=lambda b: b.start)],
         })
-    json.dump(doc, open(out, "w"))
+    tmp = out + ".tmp"
+    with open(tmp, "w") as fp:
+        json.dump(doc, fp)
+        fp.flush()
+        os.fsync(fp.fileno())
+    os.replace(tmp, out)
     print(f"[*] wrote {out}")
 
 

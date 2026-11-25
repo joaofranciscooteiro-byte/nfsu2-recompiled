@@ -17,3 +17,9 @@ android {
     // adrenotools opens its namespace hook libraries by path from nativeLibraryDir.
     packaging { jniLibs { useLegacyPackaging true } }
 }
+
+
+dependencies {
+    // RAR (including modern RAR5 archives) extraction for the in-app mod installer.
+    implementation 'com.github.junrar:junrar:8.1.2'
+}

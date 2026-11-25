@@ -1,0 +1,217 @@
+--- a/android/app/build.gradle
++++ b/android/app/build.gradle
+@@ -17,3 +17,9 @@
+     // adrenotools opens its namespace hook libraries by path from nativeLibraryDir.
+     packaging { jniLibs { useLegacyPackaging true } }
+ }
++
++
++dependencies {
++    // RAR (including modern RAR5 archives) extraction for the in-app mod installer.
++    implementation 'com.github.junrar:junrar:8.1.2'
++}
+--- a/android/app/src/main/java/com/nfsu2/androidevolved/LauncherActivity.java
++++ b/android/app/src/main/java/com/nfsu2/androidevolved/LauncherActivity.java
+@@ -36,7 +36,7 @@
+  * right (Vulkan driver, resolution, frame cap, widescreen, compatibility).
+  */
+ public final class LauncherActivity extends Activity {
+-    private static final int REQUEST_DRIVER_ZIP = 45, REQUEST_DRIVER_PROBE = 46;
++    private static final int REQUEST_DRIVER_ZIP = 45, REQUEST_DRIVER_PROBE = 46, REQUEST_MOD_ARCHIVE = 47;
+     // NFSU2 green.
+     private static final int ACCENT = 0xFF8EE03A;
+     /** {label, guest language name, LANGUAGES/<file>.bin}. */
+@@ -220,6 +220,7 @@
+             optionsList.addView(optionRow("Driver Vulkan", driver == null ? "Del sistema" : driver.name, this::chooseDriver));
+         optionsList.addView(optionRow("Probar driver", "GPU y funciones Vulkan", () -> probeDriver(false)));
+         optionsList.addView(optionRow("Idioma", languageLabel(), this::chooseLanguage));
++        optionsList.addView(optionRow("Instalar mods", "ZIP · RAR", this::chooseModArchive));
+         optionsList.addView(optionRow("Reiniciar caché gráfica", "Regenerar shaders", () -> GraphicsCache.prompt(this)));
+         for (GameOptions.Option option : GameOptions.ALL)
+             optionsList.addView(optionRow(option.title, option.label(GameOptions.get(this, option.key)), () -> chooseOption(option)));
+@@ -387,6 +388,8 @@
+         if (requestCode == REQUEST_DRIVER_PROBE) {
+             showDriverReport(resultCode == RESULT_OK && data != null ? data.getStringExtra("gpu_report")
+                     : "{\"probeError\":\"La prueba se cerró o fue cancelada.\",\"driverLoadFailed\":true}");
++        } else if (requestCode == REQUEST_MOD_ARCHIVE && resultCode == RESULT_OK && data != null && data.getData() != null) {
++            installModArchive(data.getData());
+         } else if (requestCode == REQUEST_DRIVER_ZIP && resultCode == RESULT_OK && data != null && data.getData() != null) {
+             Uri zip = data.getData();
+             status.setText("Importando driver Vulkan…");
+@@ -541,6 +544,176 @@
+         else requestPermissions(new String[] {Manifest.permission.READ_EXTERNAL_STORAGE, Manifest.permission.WRITE_EXTERNAL_STORAGE}, 1);
+     }
+ 
++    // ---- Mod installer (ZIP/RAR) -------------------------------------------------------------------------
++
++    private void chooseModArchive() {
++        if (!allowed()) {
++            message("Instalar mods", "Primeiro permita o acesso à pasta nfsu2.");
++            requestAccess();
++            return;
++        }
++        Intent picker = new Intent(Intent.ACTION_OPEN_DOCUMENT);
++        picker.addCategory(Intent.CATEGORY_OPENABLE);
++        picker.setType("*/*");
++        picker.putExtra(Intent.EXTRA_MIME_TYPES, new String[] {"application/zip", "application/x-zip-compressed",
++                "application/vnd.rar", "application/x-rar-compressed", "application/octet-stream"});
++        startActivityForResult(picker, REQUEST_MOD_ARCHIVE);
++    }
++
++    private void installModArchive(Uri archiveUri) {
++        final File root = gameRoot();
++        status.setText("Lendo arquivo do mod…");
++        worker.execute(() -> {
++            File stage = new File(getCacheDir(), "mod_stage_" + System.currentTimeMillis());
++            File archive = new File(getCacheDir(), "selected_mod_" + System.currentTimeMillis()
++                    + (archiveName(archiveUri).toLowerCase(java.util.Locale.ROOT).endsWith(".rar") ? ".rar" : ".zip"));
++            try {
++                if (!root.isDirectory() && !root.mkdirs()) throw new java.io.IOException("Não foi possível acessar a pasta nfsu2.");
++                try (java.io.InputStream in = getContentResolver().openInputStream(archiveUri);
++                     java.io.OutputStream out = new java.io.FileOutputStream(archive)) {
++                    if (in == null) throw new java.io.IOException("Não foi possível abrir o arquivo selecionado.");
++                    byte[] buffer = new byte[32768]; int n; long total = 0;
++                    while ((n = in.read(buffer)) != -1) {
++                        total += n;
++                        if (total > 1024L * 1024L * 1024L) throw new java.io.IOException("Arquivo compactado maior que 1 GB.");
++                        out.write(buffer, 0, n);
++                    }
++                }
++                if (!stage.mkdirs()) throw new java.io.IOException("Não foi possível criar a pasta temporária.");
++                String lower = archive.getName().toLowerCase(java.util.Locale.ROOT);
++                if (lower.endsWith(".rar")) {
++                    com.github.junrar.Junrar.extract(archive, stage);
++                } else if (lower.endsWith(".zip")) {
++                    extractZipSafely(archive, stage);
++                } else {
++                    throw new java.io.IOException("Formato não reconhecido. Escolha um arquivo ZIP ou RAR.");
++                }
++                int files = countFiles(stage);
++                if (files == 0) throw new java.io.IOException("O arquivo não contém arquivos para instalar.");
++                int conflicts = countConflicts(stage, stage, root);
++                main.post(() -> {
++                    if (isFinishing() || isDestroyed()) { deleteTree(stage); archive.delete(); return; }
++                    String summary = files + " arquivo(s) encontrado(s)." + (conflicts > 0
++                            ? "\n" + conflicts + " já existem no jogo." : "")
++                            + "\n\nDestino: " + root.getAbsolutePath()
++                            + "\n\nDeseja instalar? Arquivos existentes "
++                            + (conflicts > 0 ? "podem ser substituídos." : "serão mantidos.");
++                    new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
++                            .setTitle("Instalar mod")
++                            .setMessage(summary)
++                            .setPositiveButton(conflicts > 0 ? "Substituir existentes" : "Instalar", (d, w) ->
++                                    finishModInstall(stage, archive, root, true))
++                            .setNegativeButton(conflicts > 0 ? "Manter existentes" : "Cancelar", (d, w) -> {
++                                if (conflicts > 0) finishModInstall(stage, archive, root, false);
++                                else { deleteTree(stage); archive.delete(); status.setText("Instalação cancelada."); }
++                            })
++                            .setOnCancelListener(d -> { deleteTree(stage); archive.delete(); status.setText("Instalação cancelada."); })
++                            .show();
++                });
++            } catch (Exception error) {
++                deleteTree(stage); archive.delete();
++                main.post(() -> { refresh(); message("Instalar mod", "Não foi possível instalar: " + error.getMessage()); });
++            }
++        });
++    }
++
++    private String archiveName(Uri uri) {
++        String name = uri.getLastPathSegment();
++        try (android.database.Cursor c = getContentResolver().query(uri, null, null, null, null)) {
++            if (c != null && c.moveToFirst()) {
++                int col = c.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME);
++                if (col >= 0) name = c.getString(col);
++            }
++        } catch (Exception ignored) { }
++        return name == null ? "mod.zip" : name;
++    }
++
++    private static void extractZipSafely(File zip, File destination) throws java.io.IOException {
++        java.util.zip.ZipInputStream zis = new java.util.zip.ZipInputStream(new java.io.BufferedInputStream(new java.io.FileInputStream(zip)));
++        try {
++            java.util.zip.ZipEntry entry;
++            byte[] buffer = new byte[32768];
++            while ((entry = zis.getNextEntry()) != null) {
++                File out = safeChild(destination, entry.getName());
++                if (entry.isDirectory()) {
++                    if (!out.isDirectory() && !out.mkdirs()) throw new java.io.IOException("Não foi possível criar diretório do ZIP.");
++                } else {
++                    File parent = out.getParentFile();
++                    if (parent != null && !parent.isDirectory() && !parent.mkdirs()) throw new java.io.IOException("Não foi possível criar diretório do ZIP.");
++                    try (java.io.FileOutputStream fos = new java.io.FileOutputStream(out)) {
++                        int n; while ((n = zis.read(buffer)) != -1) fos.write(buffer, 0, n);
++                    }
++                }
++                zis.closeEntry();
++            }
++        } finally { zis.close(); }
++    }
++
++    private static File safeChild(File root, String name) throws java.io.IOException {
++        if (name == null || name.trim().isEmpty() || name.startsWith("/") || name.indexOf('\\') >= 0)
++            throw new java.io.IOException("O arquivo compactado contém um caminho inválido.");
++        File base = root.getCanonicalFile();
++        File child = new File(base, name).getCanonicalFile();
++        if (!child.getPath().startsWith(base.getPath() + File.separator))
++            throw new java.io.IOException("O arquivo compactado tenta gravar fora da pasta temporária.");
++        return child;
++    }
++
++    private static int countFiles(File dir) {
++        File[] entries = dir.listFiles(); if (entries == null) return 0;
++        int count = 0; for (File f : entries) count += f.isDirectory() ? countFiles(f) : 1; return count;
++    }
++
++    private static int countConflicts(File base, File current, File target) throws java.io.IOException {
++        File[] entries = current.listFiles(); if (entries == null) return 0;
++        int count = 0;
++        for (File f : entries) {
++            File relative = new File(base.toURI().relativize(f.toURI()).getPath());
++            File dest = new File(target, relative.getPath());
++            if (f.isDirectory()) count += countConflicts(base, f, target);
++            else if (dest.exists()) count++;
++        }
++        return count;
++    }
++
++    private void finishModInstall(File stage, File archive, File root, boolean overwrite) {
++        status.setText("Instalando mod…");
++        worker.execute(() -> {
++            int copied = 0, skipped = 0;
++            try {
++                java.util.ArrayDeque<File> pending = new java.util.ArrayDeque<>(); pending.push(stage);
++                while (!pending.isEmpty()) {
++                    File dir = pending.pop(); File[] entries = dir.listFiles(); if (entries == null) continue;
++                    for (File f : entries) {
++                        String rel = stage.toURI().relativize(f.toURI()).getPath();
++                        File dest = safeChild(root, rel);
++                        if (f.isDirectory()) { if (!dest.isDirectory() && !dest.mkdirs()) throw new java.io.IOException("Falha ao criar " + rel); pending.push(f); }
++                        else if (dest.exists() && !overwrite) skipped++;
++                        else {
++                            File parent = dest.getParentFile(); if (parent != null && !parent.isDirectory() && !parent.mkdirs()) throw new java.io.IOException("Falha ao criar pasta de destino.");
++                            try (java.io.InputStream in = new java.io.FileInputStream(f); java.io.OutputStream out = new java.io.FileOutputStream(dest)) {
++                                byte[] b = new byte[32768]; int n; while ((n = in.read(b)) != -1) out.write(b, 0, n);
++                            }
++                            copied++;
++                        }
++                    }
++                }
++                final int installed = copied, kept = skipped;
++                deleteTree(stage); archive.delete();
++                main.post(() -> { refresh(); message("Mod instalado", installed + " arquivo(s) instalado(s)." + (kept > 0 ? "\n" + kept + " arquivo(s) mantido(s) sem substituir." : "")); });
++            } catch (Exception error) {
++                deleteTree(stage); archive.delete();
++                main.post(() -> { refresh(); message("Instalação interrompida", error.getMessage()); });
++            }
++        });
++    }
++
++    private static void deleteTree(File file) {
++        if (file == null || !file.exists()) return;
++        if (file.isDirectory()) { File[] children = file.listFiles(); if (children != null) for (File child : children) deleteTree(child); }
++        file.delete();
++    }
++
+     @Override public void onRequestPermissionsResult(int code, String[] permissions, int[] results) {
+         super.onRequestPermissionsResult(code, permissions, results);
+         refresh();
